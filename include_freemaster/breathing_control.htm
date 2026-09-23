@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<!--
+    Copyright 2020 - 2026 NXP
+
+    NXP Proprietary. This software is owned or controlled by NXP and may only be
+    used strictly in accordance with the applicable license terms. By expressly
+    accepting such terms or by downloading, installing, activating and/or otherwise
+    using the software, you are agreeing that you have read, and that you agree to
+    comply with and are bound by, such license terms. If you do not agree to be
+    bound by the applicable license terms, then you may not retain, install,
+    activate or otherwise use the software.
+    -------------------------------------------------------------------------------
+    FreeMASTER control page for the EMIOS PWM LED "breathing" demo.
+
+    IMPORTANT: This page uses the CLASSIC FreeMASTER HTML engine (Internet
+    Explorer / Trident) and the ActiveX "PC Master Services" object, exactly
+    like the PMSM MCAT reference control page. It will NOT work in the modern
+    Chromium/Edge page engine. In FreeMASTER, make sure the page engine is set
+    to Internet Explorer (Tools -> Options -> HTML Pages / Control Page, choose
+    the IE/Trident engine) before loading this page.
+
+    Target variables (defined in src/main.c):
+        breathe_duty_max    (sint32)  peak brightness, 0x8000 == 100%
+        breathe_speed       (sint32)  brightness change per animation tick
+        breathe_poll_delay  (uint32)  busy-wait spin count between FMSTR_Poll()
+        dutyCycle           (uint16)  live LED brightness (read only here)
+
+    pcm API convention (classic ActiveX):
+        pcm.ReadVariable(name)          -> truthy on success; value is then in
+                                           pcm.LastVariable_vValue
+        pcm.WriteVariable(name, value, retMsg)
+        pcm.SubscribeVariable(name, periodMs)
+        FreeMASTER calls back pcm_OnVariableChanged (VBScript shim below) which
+        forwards to Event_OnVariableChanged() in JavaScript.
+
+    To attach this page: in the FreeMASTER project tree, open the item's
+    properties and set the Control Page URL to this .htm file. The .pmpx just
+    stores that path.
+-->
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Real-Time ADC Monitoring and LED Dimming Using FreeMASTER for FRDM-A-S32K344</title>
+    <style>
+        body {
+            font-family: "Segoe UI", Tahoma, Arial, sans-serif;
+            background: #1e2530;
+            color: #e6ebf2;
+            margin: 0;
+            padding: 18px;
+        }
+        h1 { font-size: 20px; margin: 0; color: #6cc0ff; }
+        .subtitle { font-size: 12px; color: #9aa7b8; margin: 0 0 14px 0; }
+        .card {
+            background: #2a3340;
+            border: 1px solid #38424f;
+            border-radius: 10px;
+            padding: 14px 16px;
+            margin-bottom: 12px;
+        }
+
+        /* ---- Three knobs side-by-side in one card ---- */
+        .knobs-panel {
+            display: table;
+            width: 100%;
+            border-collapse: collapse;
+        }
+        /* Each knob column - equal 28% width */
+        .knob-cell {
+            display: table-cell;
+            vertical-align: top;
+            text-align: center;
+            padding: 4px 16px;
+            width: 28%;
+        }
+        .knob-cell:first-child { padding-left: 0; }
+        .knob-divider {
+            display: table-cell;
+            width: 1px;
+            background: #38424f;
+            padding: 0;
+        }
+        .knob-cell-label {
+            font-weight: 600;
+            font-size: 13px;
+            margin-bottom: 6px;
+        }
+        .knob-value {
+            font-family: "Consolas", monospace;
+            font-size: 18px;
+            font-weight: 600;
+            color: #ffd27f;
+            margin-top: 4px;
+        }
+        .desc { font-size: 12px; color: #9aa7b8; margin-top: 4px; }
+        .warn { color: #ff9a9a; }
+        canvas { cursor: grab; display: block; margin: 0 auto; }
+        canvas.dragging { cursor: grabbing; }
+
+        /* Step buttons with value sandwiched between them */
+        .step-btns {
+            margin-top: 6px;
+            text-align: center;
+            white-space: nowrap;
+        }
+        .step-btns button {
+            vertical-align: middle;
+            padding: 4px 12px;
+            margin: 0 4px;
+            background: #2a3340;
+            color: #6cc0ff;
+            border: 2px solid #4a729a;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .step-btns button:hover {
+            background: #323e4e;
+            color: #8dd4ff;
+            border-color: #4a729a;
+        }
+        body.light .step-btns button {
+            background: #ffffff;
+            color: #1766b3;
+            border: 2px solid #255d99;
+        }
+        body.light .step-btns button:hover {
+            background: #eef3fb;
+            color: #255d99;
+            border-color: #1766b3;
+        }
+        .step-btns .knob-value {
+            display: inline-block;
+            vertical-align: middle;
+            margin-top: 0;
+            min-width: 36px;
+        }
+
+        /* ---- Current duty readback (vertical bar, inline with knobs) ---- */
+        .duty-cell {
+            display: table-cell;
+            vertical-align: top;
+            text-align: center;
+            padding: 4px 16px;
+            width: 18%;
+        }
+        .vbar-wrap {
+            width: 28px;
+            height: 130px;
+            background: #1a2029;
+            border-radius: 14px;
+            overflow: hidden;
+            position: relative;
+            margin: 6px auto 4px auto;
+        }
+        .vbar-fill {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 0%;
+            background: linear-gradient(0deg, #3a6, #6cc0ff);
+            border-radius: 11px;
+        }
+        .duty-value {
+            font-family: "Consolas", monospace;
+            font-size: 13px;
+            font-weight: 600;
+            color: #ffd27f;
+            margin-top: 2px;
+        }
+
+        /* ---- Buttons ---- */
+        button {
+            background: #34597d; color: #eaf3ff; border: 1px solid #4a729a;
+            border-radius: 6px; padding: 6px 13px; font-size: 13px;
+            cursor: pointer; margin-right: 8px;
+        }
+        button:hover { background: #3f6b95; }
+        button.reset { background: #5d4a34; border-color: #8a6b45; }
+        button.reset:hover { background: #74593f; }
+
+        /* ---- Header / toolbar ---- */
+        .header {
+            display: -ms-flexbox; display: flex;
+            -ms-flex-align: start; align-items: flex-start;
+            -ms-flex-pack: justify; justify-content: space-between;
+        }
+        .header-left { -ms-flex: 1 1 auto; flex: 1 1 auto; }
+        .header h1 { margin: 0; }
+        .toolbar { -ms-flex: 0 0 auto; flex: 0 0 auto; text-align: right; }
+        .toolbar-buttons {
+            display: -ms-flexbox; display: flex;
+            -ms-flex-align: center; align-items: center;
+            -ms-flex-pack: end; justify-content: flex-end;
+        }
+        .toolbar button { margin-right: 0; margin-left: 7px; }
+        .toolbar-status {
+            display: block; margin-top: 6px;
+            font-size: 12px; color: #9aa7b8; white-space: nowrap;
+        }
+
+        /* ---- Light theme overrides ---- */
+        body.light { background: #f4f6fa; color: #1e2530; }
+        body.light h1 { color: #1766b3; }
+        body.light .subtitle { color: #5a6779; }
+        body.light .card { background: #ffffff; border-color: #d4dae3; }
+        body.light .knob-divider { background: #d4dae3; }
+        body.light .desc { color: #5a6779; }
+        body.light .knob-value { color: #b06a00; }
+        body.light .warn { color: #c23030; }
+        body.light button { background: #2d6cb0; color: #ffffff; border-color: #255d99; }
+        body.light button:hover { background: #3a7dc4; }
+        body.light button.reset { background: #b07a2d; border-color: #996726; }
+        body.light button.reset:hover { background: #c48c3a; }
+        body.light .bar-wrap { background: #dde3ec; }
+        body.light .value { color: #b06a00; }
+        body.light .vbar-wrap { background: #dde3ec; }
+        body.light .duty-value { color: #b06a00; }
+        body.light .toolbar-status { color: #5a6779; }
+        body.light .theme-toggle { background: #2d6cb0; color: #ffffff; border-color: #255d99; }
+        body.light .theme-toggle:hover { background: #3a7dc4; }
+    </style>
+</head>
+
+<body id="control_page" class="light" onload="Init()">
+
+    <!-- The FreeMASTER "PC Master Services" ActiveX control. This IS the pcm
+         object referenced by all the JavaScript below. Without this OBJECT the
+         pcm calls do nothing. -->
+    <OBJECT id="MCB_PC_Master_Services1" style="display:none;"
+            classid="clsid:48A185F1-FFDB-11D3-80E3-00C04F176153" name="pcm">
+    </OBJECT>
+
+    <!-- FreeMASTER raises variable-change events into VBScript; forward them
+         to the JavaScript handler. -->
+    <script language="VBScript">
+        Sub pcm_OnVariableChanged(a1, a2)
+            Event_OnVariableChanged a1
+        End Sub
+    </script>
+
+    <div class="header">
+        <div class="header-left">
+            <h1>Real-Time ADC Monitoring and LED Dimming Using FreeMASTER</h1>
+            <div class="subtitle">FRDM-A-S32K344 &mdash; eMIOS PWM breathing demo. Values are written live to the target.</div>
+        </div>
+        <div class="toolbar">
+            <div class="toolbar-buttons">
+                <button class="reset" onclick="resetDefaults()">Restore defaults</button>
+                <button id="themeBtn" class="theme-toggle" onclick="toggleTheme()">Dark theme</button>
+            </div>
+            <span id="toolbar_status" class="toolbar-status"></span>
+        </div>
+    </div>
+
+    <!-- All three knobs in one card -->
+    <div class="card">
+        <div class="knobs-panel">
+
+            <!-- Peak brightness -->
+            <div class="knob-cell">
+                <div class="knob-cell-label">Peak brightness<br />(Amplitude)</div>
+                <canvas id="duty_max_knob" width="96" height="96"
+                        title="Peak brightness"></canvas>
+                <div class="step-btns">
+                    <button onclick="adjustKnob('duty_max',-1)">&minus;</button>
+                    <span class="knob-value" id="duty_max_val">32768</span>
+                    <button onclick="adjustKnob('duty_max',1)">+</button>
+                </div>
+                <div class="desc">breathe_duty_max &mdash; 32768&nbsp;=&nbsp;100% duty.</div>
+            </div>
+
+            <div class="knob-divider"></div>
+
+            <!-- Breathe speed -->
+            <div class="knob-cell">
+                <div class="knob-cell-label">Breathe Speed<br />(Slope)</div>
+                <canvas id="step_knob" width="96" height="96"
+                        title="Breathe speed"></canvas>
+                <div class="step-btns">
+                    <button onclick="stepButton(-1)">&minus;</button>
+                    <span class="knob-value" id="step_val">3</span>
+                    <button onclick="stepButton(1)">+</button>
+                </div>
+                <div class="desc">breathe_speed &mdash; smaller&nbsp;=&nbsp;smoother ramp.<br />+/- mirrors board SW2/SW3.</div>
+            </div>
+
+            <div class="knob-divider"></div>
+
+            <!-- Poll delay -->
+            <div class="knob-cell">
+                <div class="knob-cell-label">Poll delay<br />(CPU Load)</div>
+                <canvas id="poll_delay_knob" width="96" height="96"
+                        title="Poll delay"></canvas>
+                <div class="step-btns">
+                    <button onclick="adjustKnob('poll_delay',-1)">&minus;</button>
+                    <span class="knob-value" id="poll_delay_val">50</span>
+                    <button onclick="adjustKnob('poll_delay',1)">+</button>
+                </div>
+                <div class="desc warn">breathe_poll_delay &mdash; keep below&nbsp;500;<br />lower if graph stutters.</div>
+            </div>
+
+            <div class="knob-divider"></div>
+
+            <!-- Current duty vertical bar -->
+            <div class="duty-cell">
+                <div class="knob-cell-label">Current<br />duty</div>
+                <div class="vbar-wrap"><div id="duty_bar" class="vbar-fill"></div></div>
+                <div class="duty-value" id="duty_val">--</div>
+                <div class="desc">dutyCycle</div>
+            </div>
+
+        </div>
+    </div>
+
+
+<script type="text/javascript">
+    /* -----------------------------------------------------------------------
+     * Configuration
+     * --------------------------------------------------------------------- */
+    var DEFAULTS = {
+        breathe_duty_max:   32768,
+        breathe_speed:      3,
+        breathe_poll_delay: 50
+    };
+
+    /* Map target variable name -> knob id prefix */
+    var SLIDERS = {
+        breathe_duty_max:   'duty_max',
+        breathe_speed:      'step',
+        breathe_poll_delay: 'poll_delay'
+    };
+
+    /* Reverse map: knob id -> target variable name (for subscription callbacks) */
+    var KNOB_VAR = {
+        duty_max:   'breathe_duty_max',
+        step:       'breathe_speed',
+        poll_delay: 'breathe_poll_delay'
+    };
+
+    /* Knob range descriptors */
+    var KNOB_CFG = {
+        duty_max:   { min: 2048,  max: 32768, step: 256,  value: 32768, varName: 'breathe_duty_max'   },
+        step:       { min: 1,     max: 20,    step: 1,    value: 3,     varName: 'breathe_speed'      },
+        poll_delay: { min: 10,    max: 500,   step: 10,   value: 50,    varName: 'breathe_poll_delay' }
+    };
+
+    var DUTY_VAR = 'dutyCycle';
+
+    /* Current theme */
+    var currentTheme = 'light';
+
+    /* -----------------------------------------------------------------------
+     * Knob drawing  (270-degree arc, IE canvas-compatible)
+     * --------------------------------------------------------------------- */
+    var KNOB_START_RAD = (135 / 180) * Math.PI;
+    var KNOB_END_RAD   = (405 / 180) * Math.PI;
+    var KNOB_SWEEP     = KNOB_END_RAD - KNOB_START_RAD;
+
+    function getKnobColors() {
+        if (currentTheme === 'light') {
+            return { track: '#c8d2de', arc: '#1766b3', knobBg: '#e8edf5',
+                     knobRim: '#255d99', dot: '#1766b3' };
+        }
+        return { track: '#38424f', arc: '#6cc0ff', knobBg: '#2a3340',
+                 knobRim: '#4a729a', dot: '#ffd27f' };
+    }
+
+    function drawKnob(id, value) {
+        var cfg = KNOB_CFG[id];
+        if (!cfg) return;
+        var canvas = document.getElementById(id + '_knob');
+        if (!canvas || !canvas.getContext) return;
+
+        var ctx    = canvas.getContext('2d');
+        var cx     = canvas.width  / 2;
+        var cy     = canvas.height / 2;
+        var rTrack = cx - 8;
+        var rKnob  = rTrack - 12;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        var col = getKnobColors();
+        var t   = (value - cfg.min) / (cfg.max - cfg.min);
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        var arcEnd = KNOB_START_RAD + t * KNOB_SWEEP;
+
+        /* Background track */
+        ctx.beginPath();
+        ctx.arc(cx, cy, rTrack, KNOB_START_RAD, KNOB_END_RAD, false);
+        ctx.strokeStyle = col.track;
+        ctx.lineWidth   = 5;
+        ctx.lineCap     = 'round';
+        ctx.stroke();
+
+        /* Value arc */
+        if (t > 0) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, rTrack, KNOB_START_RAD, arcEnd, false);
+            ctx.strokeStyle = col.arc;
+            ctx.lineWidth   = 5;
+            ctx.lineCap     = 'round';
+            ctx.stroke();
+        }
+
+        /* Knob body */
+        ctx.beginPath();
+        ctx.arc(cx, cy, rKnob, 0, 2 * Math.PI, false);
+        ctx.fillStyle   = col.knobBg;
+        ctx.fill();
+        ctx.strokeStyle = col.knobRim;
+        ctx.lineWidth   = 1.5;
+        ctx.stroke();
+
+        /* Indicator dot */
+        var dotR = rKnob - 7;
+        ctx.beginPath();
+        ctx.arc(cx + dotR * Math.cos(arcEnd), cy + dotR * Math.sin(arcEnd),
+                4, 0, 2 * Math.PI, false);
+        ctx.fillStyle = col.dot;
+        ctx.fill();
+    }
+
+    function redrawAllKnobs() {
+        for (var id in KNOB_CFG) {
+            if (!KNOB_CFG.hasOwnProperty(id)) continue;
+            drawKnob(id, KNOB_CFG[id].value);
+        }
+    }
+
+    /* Update a single knob display without writing to target (used by auto-refresh). */
+    function updateKnobDisplay(id, value) {
+        var cfg = KNOB_CFG[id];
+        if (!cfg) return;
+        cfg.value = value;
+        drawKnob(id, value);
+        document.getElementById(id + '_val').innerHTML = value;
+    }
+
+    /* -----------------------------------------------------------------------
+     * Knob mouse interaction: circular / rotary drag
+     *
+     * The knob arc runs from KNOB_START_RAD (135 deg, lower-left) clockwise
+     * to KNOB_END_RAD (405 deg == 45 deg, lower-right) covering 270 degrees.
+     * The mouse angle around the knob centre is mapped directly onto that arc
+     * so the indicator dot follows the cursor, giving a natural rotary feel.
+     *
+     * Dead-zone handling: the ~90-degree gap at the bottom of the arc is
+     * treated as a no-op region; the last known side (min or max) is kept
+     * while the cursor is inside that gap so values never jump unexpectedly.
+     * --------------------------------------------------------------------- */
+    var _drag = null;
+
+    /* Return the angle (radians, 0..2*PI) of (mx,my) relative to (cx,cy).
+     * The result is in the same coordinate space as KNOB_START_RAD / KNOB_END_RAD
+     * i.e. 0 = right, PI/2 = down, PI = left, 3*PI/2 = up. */
+    function _mouseAngle(mx, my, cx, cy) {
+        var a = Math.atan2(my - cy, mx - cx);
+        if (a < 0) a += 2 * Math.PI;
+        return a;
+    }
+
+    /* Map a raw mouse angle to a 0..1 normalised knob position.
+     * Returns null when the cursor is inside the dead-zone gap. */
+    function _angleToT(angle) {
+        /* Normalise angle relative to the arc start (KNOB_START_RAD = 135 deg). */
+        var rel = angle - KNOB_START_RAD;
+        if (rel < 0) rel += 2 * Math.PI;
+
+        /* Angles within the 270-deg sweep map directly to t = 0..1. */
+        if (rel <= KNOB_SWEEP) {
+            return rel / KNOB_SWEEP;
+        }
+        /* The remaining ~90 deg is the dead-zone gap - return null. */
+        return null;
+    }
+
+    function knobMouseDown(evt, id) {
+        var canvas = document.getElementById(id + '_knob');
+        var rect   = canvas.getBoundingClientRect();
+        var cx     = rect.left + canvas.width  / 2;
+        var cy     = rect.top  + canvas.height / 2;
+        var angle  = _mouseAngle(evt.clientX, evt.clientY, cx, cy);
+        var t      = _angleToT(angle);
+
+        canvas.className = 'dragging';
+
+        _drag = {
+            id:        id,
+            cx:        cx,
+            cy:        cy,
+            /* Whether the cursor started on the min-side or max-side of the gap;
+               used to decide which extreme to hold when inside the dead zone. */
+            lastT:     (t !== null) ? t : ((KNOB_CFG[id].value - KNOB_CFG[id].min) /
+                                           (KNOB_CFG[id].max   - KNOB_CFG[id].min))
+        };
+        evt.returnValue = false;
+        return false;
+    }
+
+    function bodyMouseMove(evt) {
+        if (!_drag) return;
+        var cfg   = KNOB_CFG[_drag.id];
+        var angle = _mouseAngle(evt.clientX, evt.clientY, _drag.cx, _drag.cy);
+        var t     = _angleToT(angle);
+
+        /* If inside the dead zone, snap to whichever extreme is closer. */
+        if (t === null) {
+            t = (_drag.lastT >= 0.5) ? 1 : 0;
+        } else {
+            _drag.lastT = t;
+        }
+
+        var range   = cfg.max - cfg.min;
+        var steps   = Math.round(t * range / cfg.step);
+        var snapped = cfg.min + steps * cfg.step;
+        if (snapped < cfg.min) snapped = cfg.min;
+        if (snapped > cfg.max) snapped = cfg.max;
+
+        if (snapped !== cfg.value) {
+            cfg.value = snapped;
+            drawKnob(_drag.id, snapped);
+            document.getElementById(_drag.id + '_val').innerHTML = snapped;
+            if (pcmReady()) {
+                try {
+                    var retMsg = '';
+                    pcm.WriteVariable(cfg.varName, snapped, retMsg);
+                    setStatus('Wrote ' + cfg.varName + ' = ' + snapped);
+                } catch (e) {
+                    setStatus('Write failed for ' + cfg.varName + ': ' + e, true);
+                }
+            } else {
+                setStatus('pcm not available - open inside FreeMASTER (IE engine).', true);
+            }
+        }
+    }
+
+    function bodyMouseUp() {
+        if (_drag) {
+            var canvas = document.getElementById(_drag.id + '_knob');
+            if (canvas) canvas.className = '';
+        }
+        _drag = null;
+    }
+
+    function attachDragHandlers() {
+        if (document.addEventListener) {
+            document.addEventListener('mousemove', bodyMouseMove, false);
+            document.addEventListener('mouseup',   bodyMouseUp,   false);
+        } else if (document.attachEvent) {
+            document.attachEvent('onmousemove', bodyMouseMove);
+            document.attachEvent('onmouseup',   bodyMouseUp);
+        }
+        for (var id in KNOB_CFG) {
+            if (!KNOB_CFG.hasOwnProperty(id)) continue;
+            (function(knobId) {
+                var canvas = document.getElementById(knobId + '_knob');
+                if (!canvas) return;
+                if (canvas.addEventListener) {
+                    canvas.addEventListener('mousedown',
+                        function(e) { knobMouseDown(e, knobId); }, false);
+                } else if (canvas.attachEvent) {
+                    canvas.attachEvent('onmousedown',
+                        function(e) { knobMouseDown(e, knobId); });
+                }
+            })(id);
+        }
+    }
+
+    /* -----------------------------------------------------------------------
+     * Status
+     * --------------------------------------------------------------------- */
+    function setStatus(msg, isError) {
+        var color = isError
+            ? (currentTheme === 'light' ? '#c23030' : '#ff9a9a')
+            : (currentTheme === 'light' ? '#5a6779' : '#9aa7b8');
+        var t = document.getElementById('toolbar_status');
+        if (t) { t.innerHTML = msg; t.style.color = color; }
+    }
+
+    /* -----------------------------------------------------------------------
+     * Theme toggle
+     * --------------------------------------------------------------------- */
+    function toggleTheme() {
+        var body = document.getElementById('control_page');
+        var btn  = document.getElementById('themeBtn');
+        if (currentTheme === 'dark') {
+            currentTheme  = 'light';
+            body.className = 'light';
+            btn.innerHTML  = 'Dark theme';
+        } else {
+            currentTheme  = 'dark';
+            body.className = '';
+            btn.innerHTML  = 'Light theme';
+        }
+        redrawAllKnobs();
+    }
+
+    /* -----------------------------------------------------------------------
+     * pcm helpers
+     * --------------------------------------------------------------------- */
+    function pcmReady() {
+        try {
+            return (typeof pcm !== 'undefined' && pcm !== null &&
+                    typeof pcm.ReadVariable !== 'undefined');
+        } catch (e) { return false; }
+    }
+
+    function readVar(varName) {
+        if (!pcmReady()) return null;
+        try {
+            if (pcm.ReadVariable(varName)) return Number(pcm.LastVariable_vValue);
+        } catch (e) {
+            setStatus('Read failed for ' + varName + ': ' + e, true);
+        }
+        return null;
+    }
+
+    /* Pull all knob values from the target and redraw. */
+    function readAll() {
+        if (!pcmReady()) {
+            setStatus('pcm not available - open inside FreeMASTER (IE engine).', true);
+            return;
+        }
+        var count = 0;
+        for (var varName in SLIDERS) {
+            if (!SLIDERS.hasOwnProperty(varName)) continue;
+            var v = readVar(varName);
+            if (v !== null && !isNaN(v)) {
+                updateKnobDisplay(SLIDERS[varName], v);
+                count++;
+            }
+        }
+        setStatus('Read ' + count + ' variable(s) from target.');
+    }
+
+    /* Write defaults to target and redraw knobs. */
+    function resetDefaults() {
+        for (var varName in DEFAULTS) {
+            if (!DEFAULTS.hasOwnProperty(varName)) continue;
+            var v  = DEFAULTS[varName];
+            var id = SLIDERS[varName];
+            updateKnobDisplay(id, v);
+            if (pcmReady()) {
+                try { var retMsg = ''; pcm.WriteVariable(varName, v, retMsg); } catch (e) {}
+            }
+        }
+        setStatus(pcmReady() ? 'Defaults restored on target.' : 'Defaults set (pcm not available).');
+    }
+
+    /* Generic +/- button handler for any knob. dir = +1 or -1, steps by cfg.step. */
+    function adjustKnob(id, dir) {
+        if (!pcmReady()) {
+            setStatus('pcm not available - open inside FreeMASTER (IE engine).', true);
+            return;
+        }
+        var cfg  = KNOB_CFG[id];
+        var cur  = readVar(cfg.varName);
+        if (cur === null || isNaN(cur)) cur = cfg.value;
+
+        var next = cur + dir * cfg.step;
+        if (next > cfg.max) next = cfg.max;
+        if (next < cfg.min) next = cfg.min;
+        try {
+            var retMsg = '';
+            pcm.WriteVariable(cfg.varName, next, retMsg);
+            updateKnobDisplay(id, next);
+            setStatus('Wrote ' + cfg.varName + ' = ' + next);
+        } catch (e) {
+            setStatus('Write failed for ' + cfg.varName + ': ' + e, true);
+        }
+    }
+
+    /* Step +/- buttons: mirror board SW2/SW3. */
+    function stepButton(dir) {
+        if (!pcmReady()) {
+            setStatus('pcm not available - open inside FreeMASTER (IE engine).', true);
+            return;
+        }
+        var cur = readVar('breathe_speed');
+        if (cur === null || isNaN(cur)) cur = KNOB_CFG['step'].value;
+
+        var next = cur + dir;
+        if (next > 20) next = 20;
+        if (next < 1)  next = 1;
+        try {
+            var retMsg = '';
+            pcm.WriteVariable('breathe_speed', next, retMsg);
+            updateKnobDisplay('step', next);
+            setStatus('Wrote breathe_speed = ' + next);
+        } catch (e) {
+            setStatus('Write failed for breathe_speed: ' + e, true);
+        }
+    }
+
+    /* -----------------------------------------------------------------------
+     * Auto-refresh: FreeMASTER subscription callback
+     *
+     * All four variables (the three knob controls + dutyCycle) are subscribed.
+     * When any value changes on the target, FreeMASTER fires this callback and
+     * we update the relevant widget without any polling loop.
+     * --------------------------------------------------------------------- */
+    function updateDutyBar() {
+        var d = readVar(DUTY_VAR);
+        if (d !== null && !isNaN(d)) {
+            document.getElementById('duty_val').innerHTML = d;
+            var pct = (d / 32768) * 100;
+            if (pct > 100) pct = 100;
+            if (pct < 0)   pct = 0;
+            document.getElementById('duty_bar').style.height = pct.toFixed(1) + '%';
+        }
+    }
+
+    /* Called by the VBScript shim for every subscribed variable change. */
+    function Event_OnVariableChanged(varName) {
+        if (varName === DUTY_VAR) {
+            updateDutyBar();
+            return;
+        }
+        /* Check if this is one of the three knob variables */
+        for (var id in KNOB_VAR) {
+            if (!KNOB_VAR.hasOwnProperty(id)) continue;
+            if (KNOB_VAR[id] === varName) {
+                var v = readVar(varName);
+                if (v !== null && !isNaN(v)) updateKnobDisplay(id, v);
+                return;
+            }
+        }
+    }
+
+    /* -----------------------------------------------------------------------
+     * Page init
+     * --------------------------------------------------------------------- */
+    function Init() {
+        attachDragHandlers();
+        redrawAllKnobs();
+
+        if (!pcmReady()) {
+            setStatus('pcm not available - open inside FreeMASTER (IE engine).', true);
+            return;
+        }
+        try {
+            /* Subscribe duty cycle for live animation */
+            pcm.SubscribeVariable(DUTY_VAR, 200);
+            /* Subscribe the three control variables so knobs auto-update
+               when the target changes them (e.g. via board buttons). */
+            pcm.SubscribeVariable('breathe_duty_max',   500);
+            pcm.SubscribeVariable('breathe_speed',      200);
+            pcm.SubscribeVariable('breathe_poll_delay', 500);
+        } catch (e) {
+            setStatus('SubscribeVariable failed: ' + e, true);
+        }
+        readAll();
+        updateDutyBar();
+    }
+</script>
+</body>
+</html>
